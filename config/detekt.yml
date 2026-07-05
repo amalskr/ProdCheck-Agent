@@ -1,0 +1,10 @@
+prodcheck:
+  active: true
+  DoubleBang:
+    active: true
+  MainThreadBlocking:
+    active: true
+  SensitiveLog:
+    active: true
+  HardcodedSecret:
+    active: true

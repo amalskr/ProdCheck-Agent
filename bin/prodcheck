@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# prodcheck — pre-production checker for any project.
+#
+# Usage:
+#   prodcheck [mode] [--yes] [path]     (path defaults to current dir)
+#
+# Modes:
+#   (none)     L1 scan + L2 agent diff review -> fix patch (no auto-apply)
+#   --l1       L1 scan only (offline)
+#   --l1fix    L1 scan + auto-fix L1 findings (asks before applying)
+#   --all      L1 scan + L2 review, then ASKS PERMISSION before auto-fixing
+#
+#   --yes      skip the confirmation prompt (for CI / scripted use)
+set -euo pipefail
+
+PRODCHECK_HOME="${PRODCHECK_HOME:-$HOME/prodcheck}"
+
+MODE="full"
+ASSUME_YES=false
+TARGET="."
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --l1)    MODE="l1" ;;
+    --l1fix) MODE="l1fix" ;;
+    --all)   MODE="all" ;;
+    --yes|--apply) ASSUME_YES=true ;;
+    *)       TARGET="$1" ;;
+  esac
+  shift
+done
+TARGET="$(cd "$TARGET" && pwd)"
+
+DETEKT_CLI="$PRODCHECK_HOME/tools/detekt-cli/bin/detekt-cli"
+RULES_JAR="$(ls "$PRODCHECK_HOME"/detekt-rules/build/libs/detekt-rules*.jar | head -1)"
+AGENT="$PRODCHECK_HOME/agent/build/install/agent/bin/agent"
+REPORT="$TARGET/build/reports/prodcheck-layer1.md"
+
+layer1_scan() {
+  SRC_DIRS=""
+  for d in $(find "$TARGET" \( -type d -path "*/src/main/java" -o -type d -path "*/src/main/kotlin" \) 2>/dev/null | grep -v "/build/"); do
+    SRC_DIRS="$SRC_DIRS,$d"
+  done
+  SRC_DIRS="${SRC_DIRS#,}"
+  [ -z "$SRC_DIRS" ] && { echo "Layer 1: no source dirs found - skipping"; return; }
+
+  echo "Layer 1: scanning..."
+  "$DETEKT_CLI" --plugins "$RULES_JAR" \
+    --config "$PRODCHECK_HOME/config/detekt.yml" \
+    --input "$SRC_DIRS" \
+    --report md:"$REPORT" > /dev/null 2>&1 || true
+
+  if [ -f "$REPORT" ]; then
+    if grep -q '^## Findings' "$REPORT"; then
+      sed -n '/^## Findings/,$p' "$REPORT" \
+        | grep -v '^\[Documentation\]' | grep -v '^generated with' \
+        > "$REPORT.tmp" && mv "$REPORT.tmp" "$REPORT"
+    else
+      echo "## Findings (0)" > "$REPORT"
+    fi
+  fi
+}
+
+l1_count() {
+  grep -m1 '^## Findings' "$REPORT" 2>/dev/null | sed 's/[^0-9]*//g' || echo 0
+}
+
+confirm() {
+  # $1 = question. Returns 0 (yes) or 1 (no).
+  [ "$ASSUME_YES" = true ] && return 0
+  printf "\n%s [y/N] " "$1"
+  read -r answer < /dev/tty
+  case "$answer" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+echo "ProdCheck -> $TARGET  (mode: $MODE)"
+mkdir -p "$TARGET/build/reports"
+cd "$TARGET"
+
+layer1_scan
+echo "Layer 1 findings: $(l1_count)   ($REPORT)"
+
+[ "$MODE" = "l1" ] && exit 0
+
+if [ "$MODE" = "l1fix" ]; then
+  [ "$(l1_count)" -eq 0 ] && { echo "Nothing to fix."; exit 0; }
+  echo ""
+  sed -n '/^## Findings/,$p' "$REPORT" | grep -E '^\* |^### ' || true
+  if confirm "Auto-fix these $(l1_count) Layer 1 finding(s) in your working tree?"; then
+    "$AGENT" --repo-root "$TARGET" \
+      --layer1-report build/reports/prodcheck-layer1.md \
+      --fix-layer1 --apply-fixes
+  else
+    echo "Skipped. Generating patch instead (review + git apply manually)..."
+    "$AGENT" --repo-root "$TARGET" \
+      --layer1-report build/reports/prodcheck-layer1.md \
+      --fix-layer1
+  fi
+  exit 0
+fi
+
+if [ "$MODE" = "all" ]; then
+  # ---- Phase 1: L1 findings -> ask, then fix ----
+  if [ "$(l1_count)" -gt 0 ]; then
+    echo ""
+    echo "=== Layer 1 findings ==="
+    sed -n '/^## Findings/,$p' "$REPORT" | grep -E '^\* |^### ' || true
+    if confirm "Auto-fix these $(l1_count) Layer 1 finding(s)?"; then
+      "$AGENT" --repo-root "$TARGET" \
+        --layer1-report build/reports/prodcheck-layer1.md \
+        --fix-layer1 --apply-fixes
+      echo ""
+      echo "=== Layer 1 re-scan (verification) ==="
+      layer1_scan
+      echo "Layer 1 findings after fix: $(l1_count)"
+    else
+      echo "Layer 1 fixes skipped."
+    fi
+  else
+    echo "Layer 1 clean."
+  fi
+
+  # ---- Phase 2: L2 review (report only), then ask, then fix ----
+  echo ""
+  echo "=== Layer 2 agent review ==="
+  "$AGENT" --repo-root "$TARGET" \
+    --layer1-report build/reports/prodcheck-layer1.md || L2_EXIT=$?
+
+  if [ -f "$TARGET/build/reports/prodcheck-layer2.md" ] \
+     && grep -q '^- \[' "$TARGET/build/reports/prodcheck-layer2.md"; then
+    if confirm "Layer 2 found issues (see report above). Auto-fix them?"; then
+      "$AGENT" --repo-root "$TARGET" \
+        --layer1-report build/reports/prodcheck-layer1.md \
+        --fix --apply-fixes || L2_EXIT=$?
+    else
+      echo "Layer 2 fixes skipped."
+    fi
+  else
+    echo "Layer 2: no findings to fix."
+  fi
+
+  # ---- Phase 3: compile verification ----
+  if [ -x "$TARGET/gradlew" ]; then
+    echo ""
+    echo "=== Compile verification ==="
+    if "$TARGET/gradlew" -p "$TARGET" compileDebugKotlin -q > /dev/null 2>&1; then
+      echo "Compile: PASS"
+    else
+      echo "Compile: FAIL - review with 'git diff'; undo with 'git checkout -- <file>'"
+    fi
+  fi
+
+  echo ""
+  echo "=== Done ==="
+  echo "Review:  git diff"
+  echo "Undo:    git checkout -- <file>"
+  exit "${L2_EXIT:-0}"
+fi
+
+# ---- default full mode: L2 review -> patch file only ----
+"$AGENT" --repo-root "$TARGET" \
+  --layer1-report build/reports/prodcheck-layer1.md \
+  --fix
